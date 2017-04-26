@@ -26,8 +26,43 @@ import sqlite3
 import superadb
 
 
+def normalize_filename(filename):
+    """Remove invalid characters from filename"""
+    return unicode(re.sub(r'[<>:"/\\|?*]', " ", filename))
+
+class PlaylistInfoProvider:
+    """Extracts information about playlists each file appears"""
+
+    def __init__(self, database):
+        self.database = database
+
+    def get_playlists(self):
+        db = sqlite3.connect(self.database, detect_types=sqlite3.PARSE_DECLTYPES)
+        db.row_factory = sqlite3.Row
+        cursor = db.cursor()
+
+        cursor.execute("""SELECT
+	                        Music.LocalCopyPath,
+	                        Music.Title,
+	                        Lists.Name
+                          FROM Music, Lists, ListItems
+                          WHERE
+	                        Lists.Id = ListItems.ListId AND
+                            ListItems.MusicId = Music.Id""")
+        rows = cursor.fetchall()
+        result = {}
+        for row in rows:
+            d = dict(row)
+            key = d['LocalCopyPath']
+            if not result.has_key(key):
+                result[key] = []
+            result[key].append((d['Name'], d['Title']))
+        return result
+
+
 class PlayMusicDecrypter:
     """Decrypt MP3 file from Google Play Music offline storage (All Access)"""
+
     def __init__(self, database, infile):
         # Open source file
         self.infile = infile
@@ -83,16 +118,12 @@ class PlayMusicDecrypter:
         else:
             raise ValueError("Empty file info!")
 
-    def normalize_filename(self, filename):
-        """Remove invalid characters from filename"""
-        return unicode(re.sub(r'[<>:"/\\|?*]', " ", filename))
-
     def get_outfile(self):
         """Returns output filename based on song informations"""
-        destination_dir = os.path.join(self.normalize_filename(self.info["AlbumArtist"]),
-                                       self.normalize_filename(self.info["Album"]))
+        destination_dir = os.path.join(normalize_filename(self.info["AlbumArtist"]),
+                                       normalize_filename(self.info["Album"]))
         filename = u"{TrackNumber:02d} - {Title}.mp3".format(**self.info)
-        return os.path.join(destination_dir, self.normalize_filename(filename))
+        return os.path.join(destination_dir, normalize_filename(filename))
 
     def update_id3(self, outfile):
         """Update ID3 tags in outfile"""
@@ -167,11 +198,18 @@ def decrypt_files(source_dir="encrypted", destination_dir=".", database="music.d
     if not os.path.isdir(destination_dir):
         os.makedirs(destination_dir)
 
+    result = []
+
+    counter = 0
     files = glob.glob(os.path.join(source_dir, "*.mp3"))
     if files:
         start_time = time.time()
         for f in files:
+            counter = counter + 1
+            # if counter > 30:
+            #     break
             try:
+                print f
                 decrypter = PlayMusicDecrypter(database, f)
                 print(u"  Decrypting file {} -> {}".format(f, decrypter.get_outfile()))
             except ValueError as e:
@@ -184,11 +222,16 @@ def decrypt_files(source_dir="encrypted", destination_dir=".", database="music.d
 
             decrypter.decrypt_all(outfile)
             decrypter.update_id3(outfile)
-            os.remove(f)
+
+            result.append((os.path.basename(f), outfile))
+            # FIXME
+            # os.remove(f)
         print("  Decryption finished ({:.1f}s)!".format(time.time() - start_time))
     else:
         print("  No files found! Exiting...")
         sys.exit(1)
+
+    return result
 
 
 def main():
@@ -222,8 +265,43 @@ def main():
         pull_library(options.remote, options.library, adb=options.adb)
 
     # Decrypt all MP3 files
-    decrypt_files(options.library, destination_dir, options.database)
+    decrypted_files = decrypt_files(options.library, destination_dir, options.database)
+    p = PlaylistInfoProvider(options.database)
+    playlists = p.get_playlists()
 
+    prepared_playlists = {}
+    songs_total = 0
+    songs_with_playlist = 0
+
+    for source_path, final_path in decrypted_files:
+        songs_total = songs_total + 1
+
+        # print u"{} -> {}, playlist: {} ({})".format(
+        #     source_path,
+        #     final_path,
+        #     playlists.has_key(source_path),
+        #     playlists[source_path] if playlists.has_key(source_path) else ""
+        # )
+        if playlists.has_key(source_path):
+            songs_with_playlist = songs_with_playlist + 1
+            for playlist_name, song_title in playlists[source_path]:
+                playlist_file = destination_dir + "/../" + normalize_filename(playlist_name) + ".m3u"
+                if not prepared_playlists.has_key(playlist_file):
+                    prepared_playlists[playlist_file] = []
+                prepared_playlists[playlist_file].append((song_title, final_path))
+
+    # pprint.pprint(playlists)
+    # pprint.pprint(prepared_playlists)
+
+    print "Songs total: {}, with playlist: {}".format(songs_total, songs_with_playlist)
+
+    for m3u in prepared_playlists.keys():
+        f = open(m3u, 'w')
+        f.write("#EXTM3U\n")
+        for (title, path) in prepared_playlists[m3u]:
+            f.write(u"#EXTINF:0, {}\n".format(title).encode("utf8"))
+            f.write(u"{}\n".format(path).encode("utf8"))
+        f.close()
 
 if __name__ == "__main__":
     main()
